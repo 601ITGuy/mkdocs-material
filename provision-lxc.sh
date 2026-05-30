@@ -12,7 +12,7 @@ REPO_URL="https://github.com/601ITGuy/mkdocs-material.git"
 LXC_HOSTNAME="mkdocs-material"
 LXC_MEMORY=2048
 LXC_SWAP=512
-LXC_CORES=2
+LXC_CORES=4
 LXC_DISK=16
 
 ssh_pve() {

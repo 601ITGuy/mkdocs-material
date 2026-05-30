@@ -124,7 +124,7 @@ jobs:
                 --hostname $LXC_HOSTNAME \
                 --memory 2048 \
                 --swap 512 \
-                --cores 2 \
+                --cores 4 \
                 --rootfs ${STORAGE}:16 \
                 --net0 name=eth0,bridge=${BRIDGE},ip=dhcp \
                 --unprivileged 1 \
