@@ -1,0 +1,232 @@
+name: Provision Proxmox LXC
+
+on:
+  workflow_dispatch:
+    inputs:
+      vmid:
+        description: 'LXC container ID (leave blank to auto-assign next available)'
+        required: false
+        default: ''
+      storage:
+        description: 'Proxmox storage pool for root disk'
+        required: false
+        default: 'local-lvm'
+      bridge:
+        description: 'Network bridge'
+        required: false
+        default: 'vmbr0'
+
+env:
+  PROXMOX_HOST: 192.168.40.202
+  PROXMOX_USER: root
+  REPO_URL: https://github.com/601ITGuy/mkdocs-material.git
+  LXC_HOSTNAME: mkdocs-material
+
+jobs:
+  provision:
+    name: Create & provision LXC on Proxmox
+    runs-on: self-hosted
+
+    steps:
+      - name: Verify Proxmox connectivity
+        env:
+          PROXMOX_PASS: ${{ secrets.PROXMOX_PASS }}
+        run: |
+          sshpass -p "$PROXMOX_PASS" ssh \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=10 \
+            "$PROXMOX_USER@$PROXMOX_HOST" \
+            "pveversion"
+
+      - name: Detect environment & resolve VMID
+        id: env
+        env:
+          PROXMOX_PASS: ${{ secrets.PROXMOX_PASS }}
+          INPUT_VMID: ${{ github.event.inputs.vmid }}
+          INPUT_STORAGE: ${{ github.event.inputs.storage }}
+          INPUT_BRIDGE: ${{ github.event.inputs.bridge }}
+        run: |
+          INFO=$(sshpass -p "$PROXMOX_PASS" ssh \
+            -o StrictHostKeyChecking=no \
+            "$PROXMOX_USER@$PROXMOX_HOST" "
+              # Resolve VMID
+              if [ -n '$INPUT_VMID' ]; then
+                VMID='$INPUT_VMID'
+              else
+                VMID=\$(pvesh get /cluster/nextid 2>/dev/null || echo 200)
+              fi
+              echo VMID=\$VMID
+
+              # Resolve storage
+              STORAGE='$INPUT_STORAGE'
+              if ! pvesm status --content rootdir 2>/dev/null | grep -q \"\$STORAGE\"; then
+                STORAGE=\$(pvesm status --content rootdir 2>/dev/null | awk 'NR==2{print \$1}')
+              fi
+              [ -z \"\$STORAGE\" ] && STORAGE=local-lvm
+              echo STORAGE=\$STORAGE
+
+              # Resolve bridge
+              BRIDGE='$INPUT_BRIDGE'
+              if ! ip link show \"\$BRIDGE\" &>/dev/null; then
+                BRIDGE=\$(ip link show type bridge 2>/dev/null | awk -F': ' '/^[0-9]+/{print \$2}' | head -1)
+              fi
+              [ -z \"\$BRIDGE\" ] && BRIDGE=vmbr0
+              echo BRIDGE=\$BRIDGE
+
+              # Check for Ubuntu 22.04 template
+              TMPL=\$(pveam list local 2>/dev/null | awk '/ubuntu-22.04/{print \$1; exit}')
+              echo TMPL=\$TMPL
+          ")
+          echo "$INFO"
+          eval "$INFO"
+          echo "vmid=$VMID"       >> "$GITHUB_OUTPUT"
+          echo "storage=$STORAGE" >> "$GITHUB_OUTPUT"
+          echo "bridge=$BRIDGE"   >> "$GITHUB_OUTPUT"
+          echo "tmpl=$TMPL"       >> "$GITHUB_OUTPUT"
+
+      - name: Download Ubuntu 22.04 template (if needed)
+        if: steps.env.outputs.tmpl == ''
+        env:
+          PROXMOX_PASS: ${{ secrets.PROXMOX_PASS }}
+        run: |
+          sshpass -p "$PROXMOX_PASS" ssh \
+            -o StrictHostKeyChecking=no \
+            "$PROXMOX_USER@$PROXMOX_HOST" "
+              pveam update
+              pveam download local ubuntu-22.04-standard_22.04-1_amd64.tar.zst
+          "
+
+      - name: Resolve template path
+        id: tmpl
+        env:
+          PROXMOX_PASS: ${{ secrets.PROXMOX_PASS }}
+          TMPL_FROM_ENV: ${{ steps.env.outputs.tmpl }}
+        run: |
+          if [ -n "$TMPL_FROM_ENV" ]; then
+            echo "path=$TMPL_FROM_ENV" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=local:vztmpl/ubuntu-22.04-standard_22.04-1_amd64.tar.zst" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create LXC container
+        env:
+          PROXMOX_PASS: ${{ secrets.PROXMOX_PASS }}
+          VMID: ${{ steps.env.outputs.vmid }}
+          STORAGE: ${{ steps.env.outputs.storage }}
+          BRIDGE: ${{ steps.env.outputs.bridge }}
+          TMPL: ${{ steps.tmpl.outputs.path }}
+        run: |
+          echo "Creating LXC $VMID with storage=$STORAGE bridge=$BRIDGE template=$TMPL"
+          sshpass -p "$PROXMOX_PASS" ssh \
+            -o StrictHostKeyChecking=no \
+            "$PROXMOX_USER@$PROXMOX_HOST" "
+              pct create $VMID $TMPL \
+                --hostname $LXC_HOSTNAME \
+                --memory 2048 \
+                --swap 512 \
+                --cores 4 \
+                --rootfs ${STORAGE}:16 \
+                --net0 name=eth0,bridge=${BRIDGE},ip=dhcp \
+                --unprivileged 1 \
+                --features nesting=1 \
+                --onboot 1
+          "
+
+      - name: Start LXC and wait for boot
+        env:
+          PROXMOX_PASS: ${{ secrets.PROXMOX_PASS }}
+          VMID: ${{ steps.env.outputs.vmid }}
+        run: |
+          sshpass -p "$PROXMOX_PASS" ssh \
+            -o StrictHostKeyChecking=no \
+            "$PROXMOX_USER@$PROXMOX_HOST" "pct start $VMID"
+          echo "Waiting 15s for container to boot and get DHCP lease..."
+          sleep 15
+
+      - name: Install system packages & Node.js 18
+        env:
+          PROXMOX_PASS: ${{ secrets.PROXMOX_PASS }}
+          VMID: ${{ steps.env.outputs.vmid }}
+        run: |
+          sshpass -p "$PROXMOX_PASS" ssh \
+            -o StrictHostKeyChecking=no \
+            "$PROXMOX_USER@$PROXMOX_HOST" "
+              pct exec $VMID -- bash -c '
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update -q
+                apt-get install -y -q \
+                  build-essential curl git ca-certificates gnupg \
+                  python3.11 python3.11-dev python3.11-venv python3-pip \
+                  libcairo2-dev libffi-dev zlib1g-dev libjpeg-dev libfreetype6-dev \
+                  pngquant
+                curl -fsSL https://deb.nodesource.com/setup_18.x | bash - 2>&1 | tail -3
+                apt-get install -y nodejs
+                echo \"node: \$(node --version) | python: \$(python3 --version)\"
+              '
+          "
+
+      - name: Clone repository
+        env:
+          PROXMOX_PASS: ${{ secrets.PROXMOX_PASS }}
+          VMID: ${{ steps.env.outputs.vmid }}
+        run: |
+          sshpass -p "$PROXMOX_PASS" ssh \
+            -o StrictHostKeyChecking=no \
+            "$PROXMOX_USER@$PROXMOX_HOST" "
+              pct exec $VMID -- bash -c '
+                git clone --depth=1 $REPO_URL /opt/mkdocs-material
+                echo \"Cloned into /opt/mkdocs-material\"
+              '
+          "
+
+      - name: Install Python packages
+        env:
+          PROXMOX_PASS: ${{ secrets.PROXMOX_PASS }}
+          VMID: ${{ steps.env.outputs.vmid }}
+        run: |
+          sshpass -p "$PROXMOX_PASS" ssh \
+            -o StrictHostKeyChecking=no \
+            "$PROXMOX_USER@$PROXMOX_HOST" "
+              pct exec $VMID -- bash -c '
+                cd /opt/mkdocs-material
+                pip install --break-system-packages -e \".[recommended,imaging]\" 2>&1 | tail -5
+              '
+          "
+
+      - name: Build frontend assets (npm)
+        env:
+          PROXMOX_PASS: ${{ secrets.PROXMOX_PASS }}
+          VMID: ${{ steps.env.outputs.vmid }}
+        run: |
+          sshpass -p "$PROXMOX_PASS" ssh \
+            -o StrictHostKeyChecking=no \
+            "$PROXMOX_USER@$PROXMOX_HOST" "
+              pct exec $VMID -- bash -c '
+                cd /opt/mkdocs-material
+                npm install 2>&1 | tail -3
+                npm run build 2>&1 | tail -5
+              '
+          "
+
+      - name: Verify & smoke test
+        env:
+          PROXMOX_PASS: ${{ secrets.PROXMOX_PASS }}
+          VMID: ${{ steps.env.outputs.vmid }}
+        run: |
+          RESULT=$(sshpass -p "$PROXMOX_PASS" ssh \
+            -o StrictHostKeyChecking=no \
+            "$PROXMOX_USER@$PROXMOX_HOST" "
+              pct exec $VMID -- bash -c '
+                cd /opt/mkdocs-material
+                mkdocs build --quiet && echo BUILD_OK || echo BUILD_FAIL
+                echo \"mkdocs: \$(mkdocs --version)\"
+                echo \"node:   \$(node --version)\"
+                echo \"python: \$(python3 --version)\"
+                ip -4 addr show eth0 | grep -oP \"(?<=inet )[^/]+\" | head -1
+              '
+          ")
+          echo "$RESULT"
+          echo "$RESULT" | grep -q BUILD_OK || { echo "::error::mkdocs build failed"; exit 1; }
+          LXC_IP=$(echo "$RESULT" | tail -1)
+          echo "::notice::LXC $VMID is ready at $LXC_IP"
+          echo "::notice::Serve docs: pct exec $VMID -- bash -c 'cd /opt/mkdocs-material && mkdocs serve --dev-addr 0.0.0.0:8000'"
